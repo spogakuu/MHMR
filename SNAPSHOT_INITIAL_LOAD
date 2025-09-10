@@ -1,0 +1,86 @@
+# ==============================================================
+# INITIAL LOAD — RAW ➜ SNAPSHOT (create if missing, insert only)
+# ==============================================================
+
+from pyspark.sql import SparkSession, functions as F
+from datetime import datetime
+import pytz, traceback
+
+spark = SparkSession.builder.appName("Initial Load RAW->SNAPSHOT").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+
+tz = pytz.timezone("America/Chicago")
+def _ts():
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+CATALOG = "MHMR_LAKEHOUSE"
+RAW_SCHEMA  = f"{CATALOG}.RAW"
+SNAP_SCHEMA = f"{CATALOG}.SNAPSHOT"
+TEMP_SCHEMA = f"{CATALOG}.SNAPSHOT_TEMP"
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SNAP_SCHEMA}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TEMP_SCHEMA}")
+
+def ensure_snapshot_table(final_tbl: str, sample_df):
+    """Create {final_tbl} only if it does not exist."""
+    if spark._jsparkSession.catalog().tableExists(final_tbl):
+        return
+    print(f"[{_ts()}] Creating missing snapshot table: {final_tbl}")
+    empty = (
+        sample_df.limit(0)
+        .withColumn("status", F.lit("I"))
+        .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+    )
+    empty.write.mode("ignore").saveAsTable(final_tbl)
+
+def load_one(row_dict):
+    table_name = row_dict["TABLE_NAME"]
+    raw_tbl  = f"{RAW_SCHEMA}.{table_name}_RAW"
+    temp_tbl = f"{TEMP_SCHEMA}.{table_name}_SNAPSHOT_TEMP"
+    final_tbl = f"{SNAP_SCHEMA}.{table_name}_SNAPSHOT"
+
+    try:
+        print(f"[{_ts()}] Reading {raw_tbl}")
+        raw_df = spark.read.table(raw_tbl)
+
+        # Ensure snapshot exists
+        ensure_snapshot_table(final_tbl, raw_df)
+
+        # Add status + CST insert_ts
+        out_df = (
+            raw_df
+            .withColumn("status", F.lit("I"))
+            .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+        )
+
+        print(f"[{_ts()}] Writing temp snapshot for {table_name}")
+        out_df.write.mode("overwrite").saveAsTable(temp_tbl)
+
+        print(f"[{_ts()}] Inserting rows into {final_tbl}")
+        spark.sql(f"INSERT INTO {final_tbl} SELECT * FROM {temp_tbl}")
+        spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
+
+        print(f"[{_ts()}] DONE {table_name}")
+
+    except Exception as e:
+        print(f"[{_ts()}] FAILED {table_name}: {e}")
+        traceback.print_exc()
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
+        except:
+            pass
+
+def run_initial_load(max_workers=4):
+    print(f"[{_ts()}] Reading TABLES_LIST …")
+    tables_df = spark.read.table("TABLES_LIST")
+    rows = [r.asDict() for r in tables_df.collect()]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(load_one, r) for r in rows]
+        for f in as_completed(futs):
+            f.result()
+
+if __name__ == "__main__":
+    run_initial_load(max_workers=4)
